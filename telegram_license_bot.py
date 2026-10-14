@@ -155,18 +155,36 @@ def save_config(cfg):
     except Exception as e:
         print(f"Error saving {CONFIG_FILE}: {e}")
 
-def generate_license_key(machine_id, user_name, expiry_date, plan="VIP"):
-    """Generate cryptographically signed license key."""
-    payload_obj = {
-        "m": str(machine_id).upper().strip(),
-        "u": str(user_name).strip(),
-        "e": str(expiry_date).strip(),
-        "p": str(plan).strip()
-    }
-    payload_str = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
-    payload_b64 = base64.urlsafe_b64encode(payload_str.encode('utf-8')).decode('utf-8').rstrip('=')
-    sig = hmac.new(SECRET_SALT.encode('utf-8'), payload_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16].upper()
-    return f"TRVIP-{payload_b64}-{sig}"
+DL_SECRET_SALT = "TR_DL_SECURE_KEY_2026_@KhmerVideoDownloader#PRO"
+
+def generate_license_key(machine_id, user_name, expiry_date, plan="VIP", app=None):
+    """Generate cryptographically signed license key with strict app isolation."""
+    mid = str(machine_id).upper().strip()
+    is_dl = mid.startswith("TRDL-") or (app == "TR_TOOL_DL")
+
+    if is_dl:
+        payload_obj = {
+            "app": "TR_TOOL_DL",
+            "m": mid,
+            "u": str(user_name).strip(),
+            "e": str(expiry_date).strip(),
+            "p": str(plan).strip()
+        }
+        payload_str = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
+        payload_b64 = base64.urlsafe_b64encode(payload_str.encode('utf-8')).decode('utf-8').rstrip('=')
+        sig = hmac.new(DL_SECRET_SALT.encode('utf-8'), payload_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16].upper()
+        return f"TRDL-{payload_b64}-{sig}"
+    else:
+        payload_obj = {
+            "m": mid,
+            "u": str(user_name).strip(),
+            "e": str(expiry_date).strip(),
+            "p": str(plan).strip()
+        }
+        payload_str = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
+        payload_b64 = base64.urlsafe_b64encode(payload_str.encode('utf-8')).decode('utf-8').rstrip('=')
+        sig = hmac.new(SECRET_SALT.encode('utf-8'), payload_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16].upper()
+        return f"TRVIP-{payload_b64}-{sig}"
 
 class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
     bot_instance = None
@@ -229,6 +247,19 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
             if self.bot_instance:
                 self.bot_instance.revoke_license(hwid)
             self._send_json(200, {"status": "revoked", "hwid": hwid, "message": "License revoked successfully"})
+            return
+
+        if path == "/unrevoke":
+            hwid_list = params.get("hwid", [])
+            if not hwid_list:
+                self._send_json(400, {"status": "error", "message": "Missing hwid parameter"})
+                return
+            hwid = hwid_list[0].upper().strip()
+            if self.bot_instance:
+                if hasattr(self.bot_instance, "revoked_hwids"):
+                    self.bot_instance.revoked_hwids.discard(hwid)
+                remove_revoked_hwid(hwid)
+            self._send_json(200, {"status": "unrevoked", "hwid": hwid, "message": "License unrevoked successfully"})
             return
 
         if path == "/check":
@@ -352,12 +383,13 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
                 return
 
             if self.bot_instance:
+                app_kind = data.get("app", "TR_TOOL_DL" if hwid.startswith("TRDL-") else "Movie_TR")
                 self.bot_instance.handle_customer_request(
                     chat_id=0,
                     user_name=user_display,
                     username=clean_username,
                     hwid=hwid,
-                    is_online=True
+                    is_online=app_kind
                 )
                 self._send_json(200, {
                     "status": "submitted",
@@ -365,6 +397,65 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
                     "message": "Request forwarded to Admin Telegram"
                 })
                 return
+
+        if path in ["/activated", "/notify_key"]:
+            content_len = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_len)
+            try:
+                data = json.loads(body.decode('utf-8'))
+            except Exception:
+                data = {}
+
+            hwid = data.get("hwid", "").upper().strip()
+            user_name = data.get("user_name", "អតិថិជន VIP").strip()
+            exp_date = data.get("expiry", "LIFETIME").strip()
+            plan = data.get("plan", "VIP").strip()
+            key = data.get("key", "").strip()
+
+            if not hwid:
+                self._send_json(400, {"status": "error", "message": "Missing hwid"})
+                return
+
+            if self.bot_instance:
+                # 1. Update approved licenses cache
+                self.bot_instance.approved_licenses[hwid] = {
+                    "key": key,
+                    "customer_name": user_name,
+                    "plan": plan,
+                    "expiry_date": exp_date,
+                    "duration": "មួយជីវិត" if exp_date == "LIFETIME" else f"ដល់ {exp_date}"
+                }
+                if hasattr(self.bot_instance, "revoked_hwids"):
+                    self.bot_instance.revoked_hwids.discard(hwid)
+                remove_revoked_hwid(hwid)
+
+                # 2. Record to history
+                try:
+                    record_license_to_history(
+                        hwid, user_name, exp_date, plan, key,
+                        duration="មួយជីវិត" if exp_date == "LIFETIME" else f"ដល់ {exp_date}",
+                        notes="Key activated on client machine",
+                        channel="App Direct"
+                    )
+                except Exception:
+                    pass
+
+                # 3. Notify Admin Telegram
+                if self.bot_instance.admin_chat_id:
+                    exp_disp = "ពេញមួយជីវិត (Lifetime)" if exp_date == "LIFETIME" else f"ដល់ {exp_date}"
+                    msg = (
+                        f"🎉 *[អតិថិជនបានបញ្ចូល/ប្តូរ Key ជោគជ័យ]*\n\n"
+                        f"👤 *ឈ្មោះ:* {user_name}\n"
+                        f"💻 *Machine ID:* `{hwid}`\n"
+                        f"👑 *គម្រោង:* {plan}\n"
+                        f"📅 *សុពលភាព:* {exp_disp}\n"
+                        f"⏰ *ម៉ោង:* {datetime.now().strftime('%H:%M:%S • %d/%m/%Y')}\n\n"
+                        f"✨ កម្មវិធី Movie TR លើកុំព្យូទ័រនោះ កំពុងដំណើរការធម្មតា!"
+                    )
+                    self.bot_instance.send_message(self.bot_instance.admin_chat_id, msg)
+
+            self._send_json(200, {"status": "ok", "message": "Activation recorded and notified"})
+            return
 
         self._send_json(404, {"status": "not_found"})
 
@@ -493,14 +584,15 @@ class TelegramLicenseBot:
             keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "👑 30 ថ្ងៃ", "callback_data": f"appr:{req_id}:30"},
-                        {"text": "👑 90 ថ្ងៃ", "callback_data": f"appr:{req_id}:90"}
+                        {"text": "🎁 សាកល្បង (3 ថ្ងៃ)", "callback_data": f"appr:{req_id}:3"},
+                        {"text": "👑 VIP (30 ថ្ងៃ)", "callback_data": f"appr:{req_id}:30"}
                     ],
                     [
-                        {"text": "👑 1 ឆ្នាំ (365 ថ្ងៃ)", "callback_data": f"appr:{req_id}:365"},
-                        {"text": "💎 មួយជីវិត (Lifetime)", "callback_data": f"appr:{req_id}:LIFETIME"}
+                        {"text": "👑 VIP (90 ថ្ងៃ)", "callback_data": f"appr:{req_id}:90"},
+                        {"text": "👑 1 ឆ្នាំ (365 ថ្ងៃ)", "callback_data": f"appr:{req_id}:365"}
                     ],
                     [
+                        {"text": "💎 មួយជីវិត (Lifetime)", "callback_data": f"appr:{req_id}:LIFETIME"},
                         {"text": "❌ បោះបង់ (Cancel)", "callback_data": f"rej:{req_id}"}
                     ]
                 ]
@@ -522,27 +614,30 @@ class TelegramLicenseBot:
 
         # Notify Admin
         if self.admin_chat_id:
-            request_source = "ពីក្នុងកម្មវិធី Movie TR (Auto-Activate)" if is_online else "តាមរយៈ Telegram Bot"
+            is_dl = str(hwid).upper().startswith("TRDL-") or (str(is_online) == "TR_TOOL_DL")
+            app_title = "🚀 TR TOOL DL (Video Downloader)" if is_dl else "🎬 Movie TR AI"
+            request_source = f"ពីក្នុងកម្មវិធី {app_title} (Auto-Activate)" if is_online else "តាមរយៈ Telegram Bot"
             display_tg_user = f"{user_name} (@{username})" if (username and f"@{username}" not in user_name) else user_name
             admin_msg = (
-                f"🔔 *[មានសំណើបើកសិទ្ធិប្រើប្រាស់ថ្មី]*\n\n"
+                f"🔔 *[មានសំណើបើកសិទ្ធិប្រើប្រាស់ថ្មី — {app_title}]*\n\n"
                 f"💻 *Machine ID:* `{hwid}`\n"
                 f"👤 *អតិថិជន (Telegram):* {display_tg_user}\n"
                 f"📡 *ប្រភព:* {request_source}\n"
                 f"⏰ *ម៉ោងស្នើសុំ:* {datetime.now().strftime('%H:%M:%S • %d/%m/%Y')}\n\n"
-                f"👉 _លោក Admin គ្រាន់តែចុចប៊ូតុងខាងក្រោម កម្មវិធី Movie TR លើ PC អតិថិជននឹងបើកដំណើរការភ្លាមៗ (Auto-Activate មិនបាច់វាយ Key)៖_"
+                f"👉 _លោក Admin គ្រាន់តែចុចប៊ូតុងខាងក្រោម កម្មវិធី {app_title} លើ PC អតិថិជននឹងបើកដំណើរការភ្លាមៗ (Auto-Activate មិនបាច់វាយ Key)៖_"
             )
             keyboard = {
                 "inline_keyboard": [
                     [
-                        {"text": "👑 30 ថ្ងៃ", "callback_data": f"appr:{req_id}:30"},
-                        {"text": "👑 90 ថ្ងៃ", "callback_data": f"appr:{req_id}:90"}
+                        {"text": "🎁 សាកល្បង (3 ថ្ងៃ)", "callback_data": f"appr:{req_id}:3"},
+                        {"text": "👑 VIP (30 ថ្ងៃ)", "callback_data": f"appr:{req_id}:30"}
                     ],
                     [
-                        {"text": "👑 1 ឆ្នាំ (365 ថ្ងៃ)", "callback_data": f"appr:{req_id}:365"},
-                        {"text": "💎 មួយជីវិត (Lifetime)", "callback_data": f"appr:{req_id}:LIFETIME"}
+                        {"text": "👑 VIP (90 ថ្ងៃ)", "callback_data": f"appr:{req_id}:90"},
+                        {"text": "👑 1 ឆ្នាំ (365 ថ្ងៃ)", "callback_data": f"appr:{req_id}:365"}
                     ],
                     [
+                        {"text": "💎 មួយជីវិត (Lifetime)", "callback_data": f"appr:{req_id}:LIFETIME"},
                         {"text": "❌ បដិសេធ (Reject)", "callback_data": f"rej:{req_id}"}
                     ]
                 ]
@@ -591,11 +686,19 @@ class TelegramLicenseBot:
             if duration == "LIFETIME":
                 exp_date = "LIFETIME"
                 exp_khmer = "ពេញមួយជីវិត (Lifetime)"
+                plan_name = "VIP"
+            elif duration == "3":
+                days = 3
+                exp_dt = datetime.now() + timedelta(days=days)
+                exp_date = exp_dt.strftime("%Y-%m-%d")
+                exp_khmer = f"សាកល្បង 3 ថ្ងៃ (ដល់ {exp_date})"
+                plan_name = "Trial"
             else:
                 days = int(duration)
                 exp_dt = datetime.now() + timedelta(days=days)
                 exp_date = exp_dt.strftime("%Y-%m-%d")
                 exp_khmer = f"{days} ថ្ងៃ (ដល់ {exp_date})"
+                plan_name = "VIP"
 
             # Generate Cryptographic License Key
             username = req.get("username", "").strip()
@@ -606,7 +709,9 @@ class TelegramLicenseBot:
             else:
                 key_username = cust_name
 
-            key = generate_license_key(hwid, key_username, exp_date, plan="VIP")
+            is_dl = str(hwid).upper().startswith("TRDL-")
+            app_title = "🚀 TR TOOL DL (Video Downloader)" if is_dl else "🎬 Movie TR AI"
+            key = generate_license_key(hwid, key_username, exp_date, plan=plan_name, app="TR_TOOL_DL" if is_dl else "Movie_TR")
             # Clear from revoked list if previously revoked
             if hasattr(self, "revoked_hwids") and hwid in self.revoked_hwids:
                 self.revoked_hwids.remove(hwid)
@@ -619,7 +724,7 @@ class TelegramLicenseBot:
             self.approved_licenses[hwid] = {
                 "key": key,
                 "customer_name": key_username,
-                "plan": "VIP",
+                "plan": plan_name,
                 "expiry_date": exp_date,
                 "duration": exp_khmer
             }
@@ -628,7 +733,7 @@ class TelegramLicenseBot:
             try:
                 channel_name = "App Auto-Activation" if is_online else "Telegram Bot"
                 record_license_to_history(
-                    hwid, key_username, exp_date, "VIP", key,
+                    hwid, key_username, exp_date, plan_name, key,
                     duration=exp_khmer, notes=f"Approved by Admin ({channel_name})",
                     channel=channel_name
                 )
@@ -642,9 +747,9 @@ class TelegramLicenseBot:
                 self.admin_chat_id, message_id,
                 f"✅ *បានអនុម័ត និងបើកសិទ្ធិ (Auto-Activate) ជោគជ័យ!*\n\n"
                 f"👤 *ឈ្មោះ:* {key_username}\n"
-                f"👑 *គម្រោង:* VIP ({exp_khmer})\n"
+                f"👑 *គម្រោង:* {plan_name} ({exp_khmer})\n"
                 f"💻 *Machine ID:* `{hwid}`\n\n"
-                f"✨ *ស្ថានភាព:* កម្មវិធី Movie TR លើ PC អតិថិជននឹង Unlock បើកដំណើរការដោយស្វ័យប្រវត្តិតែម្តង (មិនបាច់ Copy ឬ Paste Key ឡើយ)!\n\n"
+                f"✨ *ស្ថានភាព:* កម្មវិធី {app_title} លើ PC អតិថិជននឹង Unlock បើកដំណើរការដោយស្វ័យប្រវត្តិតែម្តង (មិនបាច់ Copy ឬ Paste Key ឡើយ)!\n\n"
                 f"🔑 *LICENSE KEY:*\n`{key}`\n\n"
                 f"*(👉 ចុចលើ Key ខាងលើដើម្បី Copy ប្រសិនបើតម្រូវការ)*"
             )
@@ -653,7 +758,7 @@ class TelegramLicenseBot:
             if not is_admin_self and cust_chat_id:
                 cust_success_msg = (
                     f"🎉 *ការស្នើសុំ License Key ត្រូវបាន Admin អនុម័តជោគជ័យ!*\n\n"
-                    f"✨ កម្មវិធី Movie TR លើកុំព្យូទ័ររបស់អ្នកបានបើកដំណើរការ (Auto-Activate) រួចរាល់ហើយ!\n\n"
+                    f"✨ កម្មវិធី {app_title} លើកុំព្យូទ័ររបស់អ្នកបានបើកដំណើរការ (Auto-Activate) រួចរាល់ហើយ!\n\n"
                     f"👑 *គម្រោង:* VIP\n"
                     f"📅 *សុពលភាព:* {exp_khmer}\n"
                     f"💻 *សម្រាប់ម៉ាស៊ីន:* `{hwid}`\n\n"
@@ -697,19 +802,28 @@ class TelegramLicenseBot:
             user_name = parts[2] if len(parts) > 2 else "Customer"
             dur = parts[3].upper() if len(parts) > 3 else "365"
 
-            if dur == "LIFETIME":
+            if dur in ["LIFETIME", "LIFE"]:
                 exp_date = "LIFETIME"
                 exp_khmer = "ពេញមួយជីវិត (Lifetime)"
+                plan_name = "VIP"
+            elif dur in ["3", "TRIAL", "TEST"]:
+                days = 3
+                exp_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
+                exp_khmer = f"សាកល្បង 3 ថ្ងៃ (ដល់ {exp_date})"
+                plan_name = "Trial"
             else:
                 try:
                     days = int(dur)
                     exp_date = (datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")
                     exp_khmer = f"{days} ថ្ងៃ (ដល់ {exp_date})"
+                    plan_name = "VIP"
                 except Exception:
                     exp_date = dur
                     exp_khmer = f"ដល់ {exp_date}"
+                    plan_name = "VIP"
 
-            key = generate_license_key(hwid, user_name, exp_date, plan="VIP")
+            is_dl = str(hwid).upper().startswith("TRDL-")
+            key = generate_license_key(hwid, user_name, exp_date, plan=plan_name, app="TR_TOOL_DL" if is_dl else "Movie_TR")
             if hasattr(self, "revoked_hwids"):
                 self.revoked_hwids.discard(hwid)
             try:
@@ -718,7 +832,14 @@ class TelegramLicenseBot:
             except Exception:
                 pass
 
-            # Record to history
+            # Record to history and update live approved licenses for instant Auto-Activation
+            self.approved_licenses[hwid] = {
+                "key": key,
+                "customer_name": user_name,
+                "plan": plan_name,
+                "expiry_date": exp_date,
+                "duration": exp_khmer
+            }
             try:
                 import license_manager
                 license_manager.record_license_to_history(
@@ -857,8 +978,8 @@ class TelegramLicenseBot:
                     self.handle_admin_command(chat_id, text)
                     return
 
-            # Check if text contains a Machine ID: TR-XXXX-XXXX-XXXX-XXXX
-            m = re.search(r'(TR-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})', text.upper())
+            # Check if text contains a Machine ID: TRDL-XXXX-XXXX-XXXX-XXXX or TR-XXXX-XXXX-XXXX-XXXX
+            m = re.search(r'(TRDL-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}|TR-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})', text.upper())
             if m:
                 extracted_hwid = m.group(1)
                 self.handle_customer_request(chat_id, user_name, username, extracted_hwid)
@@ -866,8 +987,8 @@ class TelegramLicenseBot:
                 self.send_message(
                     chat_id,
                     "⚠️ *សូមផ្ញើលេខ Machine ID ឱ្យបានត្រឹមត្រូវ!*\n"
-                    "ទម្រង់ត្រឹមត្រូវគឺ៖ `TR-XXXX-XXXX-XXXX-XXXX`\n\n"
-                    "👉 បើកកម្មវិធី Movie TR រួចចុចប៊ូតុង *[ 📋 ចម្លង (Copy ID) ]* ឬ *[ ✈️ ផ្ញើទៅ Telegram Admin ]* ជាការស្រេច។"
+                    "ទម្រង់ត្រឹមត្រូវគឺ៖ `TRDL-XXXX-XXXX-XXXX-XXXX` ឬ `TR-XXXX-XXXX-XXXX-XXXX`\n\n"
+                    "👉 បើកកម្មវិធីរួចចុចប៊ូតុង *[ 📋 ចម្លង (Copy ID) ]* ឬ *[ ✈️ ផ្ញើទៅកាន់ Telegram Bot ]* ជាការស្រេច។"
                 )
 
     def run(self):

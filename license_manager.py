@@ -5,6 +5,7 @@ import json
 import base64
 import hashlib
 import hmac
+import re
 try:
     import winreg
 except ImportError:
@@ -260,6 +261,12 @@ def verify_license_key(key_str, current_machine_id=None):
         current_machine_id = get_hardware_id()
         
     clean_key = key_str.strip()
+    if clean_key.startswith("TRDL-") or "TR_TOOL_DL" in clean_key:
+        return False, (
+            "⚠️ នេះជា License Key របស់កម្មវិធី TR TOOL DL (Video Downloader)!\n"
+            "មិនអាចយកមកដំណើរការលើកម្មវិធី Movie TR (Movie Dubbing) បានទេ!\n\n"
+            "សូមប្រើប្រាស់ Key សម្រាប់កម្មវិធី Movie TR ដែលផ្ដើមដោយ 'TRVIP-'។"
+        )
     parts = clean_key.split('-')
     if len(parts) < 3 or parts[0] != "TRVIP":
         return False, "ទម្រង់ License Key មិនត្រឹមត្រូវ!"
@@ -288,9 +295,11 @@ def verify_license_key(key_str, current_machine_id=None):
     cur_id = current_machine_id.upper().strip()
     stored_id = get_system_stored_hwid().upper().strip()
 
-    # Check Revocation (Blacklist)
+    # Check Revocation (Blacklist for Key, Signature, and Machine ID)
     try:
-        revoked_set = load_revoked_hwids()
+        revoked_set = load_revoked_keys()
+        if clean_key in revoked_set or provided_sig in revoked_set:
+            return False, "License Key នេះត្រូវបានផ្តាច់ (Revoked) ឬជំនួសដោយ Key ថ្មីរួចហើយ!\nសូមបញ្ចូល Key ថ្មីដែលមានសុពលភាព។"
         if cur_id in revoked_set or key_machine in revoked_set:
             return False, "License សម្រាប់ម៉ាស៊ីននេះត្រូវបានផ្តាច់ និងបិទសិទ្ធិ (Revoked) ដោយ Admin រួចហើយ!"
     except Exception:
@@ -362,6 +371,86 @@ def load_license_history():
                 pass
     return []
 
+def merge_license_history(new_items):
+    """Merge incoming history records with local history without duplicates."""
+    if not isinstance(new_items, list) or not new_items:
+        return load_license_history()
+    local = load_license_history()
+    existing_map = {}
+    for item in local:
+        mid = item.get("machine_id", "").upper().strip()
+        existing_map[mid] = item
+
+    modified = False
+    for item in new_items:
+        mid = item.get("machine_id", "").upper().strip()
+        if not mid:
+            continue
+        if mid not in existing_map:
+            local.insert(0, item)
+            existing_map[mid] = item
+            modified = True
+        else:
+            # Update fields if incoming has richer or newer data
+            for k, v in item.items():
+                if v and not existing_map[mid].get(k):
+                    existing_map[mid][k] = v
+                    modified = True
+
+    if modified:
+        save_license_history(local)
+    return local
+
+def sync_license_history_from_cloud(server_url="https://movietr-license-bot.onrender.com"):
+    """Fetch all active licenses from Cloud Server and merge with local history."""
+    try:
+        import requests
+        urls = [server_url, "https://movietr-license-bot.onrender.com"]
+        urls = list(dict.fromkeys([u.strip() for u in urls if u and u.strip()]))
+        for base in urls:
+            try:
+                # 1. Try /history
+                r = requests.get(f"{base.rstrip('/')}/history", timeout=2.5)
+                if r.status_code == 200:
+                    d = r.json()
+                    cloud_hist = d.get("history", [])
+                    if cloud_hist:
+                        return merge_license_history(cloud_hist)
+
+                # 2. Try /users fallback
+                r2 = requests.get(f"{base.rstrip('/')}/users", timeout=2.5)
+                if r2.status_code == 200:
+                    d2 = r2.json()
+                    active_users = d2.get("active_users", [])
+                    if active_users:
+                        converted = []
+                        for u in active_users:
+                            hwid = u.get("hwid", "").upper().strip()
+                            cust = u.get("customer", "VIP")
+                            exp = u.get("expiry", "LIFETIME")
+                            dur = u.get("duration", "")
+                            if hwid:
+                                k = generate_license_key(hwid, cust, exp, "VIP")
+                                converted.append({
+                                    "id": f"CLOUD-{hwid[-4:]}",
+                                    "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "customer_name": cust,
+                                    "machine_id": hwid,
+                                    "plan": "VIP",
+                                    "duration": dur,
+                                    "expiry_date": exp,
+                                    "key": k,
+                                    "notes": "Synced from Cloud Telegram Bot",
+                                    "channel": "Telegram Cloud",
+                                    "status": "approved"
+                                })
+                        return merge_license_history(converted)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return load_license_history()
+
 def save_license_history(history_list):
     """Save updated history to disk and backup in LocalAppData."""
     if not isinstance(history_list, list):
@@ -389,7 +478,8 @@ def save_license_history(history_list):
 def record_license_to_history(machine_id, user_name, expiry_date, plan, key, duration=None, notes="", channel="PC Generator"):
     """
     Record an issued license to history.
-    If the key or (machine_id + plan) already exists, update the timestamp and expiry.
+    Automatically revokes/invalidates ANY previous old keys for this machine_id,
+    guaranteeing only the newest key remains active and thieves cannot use old keys.
     """
     history = load_license_history()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -415,23 +505,82 @@ def record_license_to_history(machine_id, user_name, expiry_date, plan, key, dur
         "duration": duration,
         "expiry_date": str(expiry_date).strip(),
         "key": str(key).strip(),
+        "status": "active",
         "notes": notes,
         "channel": channel
     }
 
-    # Avoid exact key duplicate, prepend newest on top
+    norm_mid = str(entry["machine_id"]).upper().strip()
+    prev_keys_to_revoke = []
     updated = False
+
     for i, item in enumerate(history):
-        if item.get("key") == entry["key"] or (item.get("machine_id") == entry["machine_id"] and item.get("key") == entry["key"]):
+        item_mid = str(item.get("machine_id", "")).upper().strip()
+        # Match same machine ID or same key
+        if item_mid == norm_mid or item.get("key") == entry["key"]:
+            old_k = item.get("key")
+            if old_k and old_k != entry["key"]:
+                prev_keys_to_revoke.append(old_k)
+                existing_prev = item.get("previous_keys", [])
+                if old_k not in existing_prev:
+                    existing_prev.append(old_k)
+                entry["previous_keys"] = existing_prev
+            entry["id"] = item.get("id", entry["id"])
+            entry["first_created_at"] = item.get("first_created_at") or item.get("created_at")
+            entry["updated_at"] = now_str
+            entry["status"] = "active"
             history[i] = entry
             updated = True
             break
 
     if not updated:
+        entry["first_created_at"] = now_str
+        entry["status"] = "active"
         history.insert(0, entry)
+
+    # Unrevoke this machine ID and this new key from revocation lists
+    try:
+        remove_revoked_hwid(norm_mid)
+        remove_revoked_key(entry["key"])
+    except Exception:
+        pass
+
+    # AUTOMATICALLY BLACKLIST ALL OLD PREVIOUS KEYS SO THEY CAN NEVER BE USED AGAIN!
+    for old_k in prev_keys_to_revoke:
+        try:
+            if old_k and old_k != entry["key"]:
+                add_revoked_key(old_k)
+        except Exception:
+            pass
 
     save_license_history(history)
     return entry
+
+def normalize_hwid(hwid_str):
+    """Normalize any HWID input to standard uppercase 16-hex core."""
+    if not hwid_str:
+        return ""
+    clean = str(hwid_str).strip().upper()
+    m = re.search(r'(?:TR|TRDL)-([A-Z0-9]{4})-([A-Z0-9]{4})-([A-Z0-9]{4})-([A-Z0-9]{4})', clean)
+    if m:
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}{m.group(4)}"
+    hex_only = re.sub(r'[^A-Z0-9]', '', clean)
+    if len(hex_only) >= 16:
+        return hex_only[:16]
+    return hex_only
+
+def find_customer_by_hwid(hwid_str):
+    """Find existing customer record by Machine ID."""
+    if not hwid_str:
+        return None
+    norm = normalize_hwid(hwid_str)
+    if not norm:
+        return None
+    history = load_license_history()
+    for item in history:
+        if normalize_hwid(item.get("machine_id", "")) == norm:
+            return item
+    return None
 
 def delete_license_from_history(entry_id_or_key):
     """Delete an entry by ID or Key."""
@@ -487,7 +636,8 @@ def get_revoked_file_path():
     base_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, REVOKED_FILE_NAME)
 
-def load_revoked_hwids():
+def load_revoked_keys():
+    """Load set of revoked license keys, signatures, and blacklisted HWIDs."""
     path = get_revoked_file_path()
     revoked = set()
     if os.path.exists(path):
@@ -495,7 +645,7 @@ def load_revoked_hwids():
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if isinstance(data, list):
-                    revoked = set(x.upper().strip() for x in data if x)
+                    revoked = set(str(x).strip() for x in data if x)
         except Exception:
             pass
     appdata = os.environ.get("LOCALAPPDATA")
@@ -506,17 +656,18 @@ def load_revoked_hwids():
                 with open(app_p, "r", encoding="utf-8") as f:
                     d = json.load(f)
                     if isinstance(d, list):
-                        revoked.update(x.upper().strip() for x in d if x)
+                        revoked.update(str(x).strip() for x in d if x)
             except Exception:
                 pass
     return revoked
 
-def save_revoked_hwids(hwids_set):
-    hwids_list = sorted(list(set(x.upper().strip() for x in hwids_set if x)))
+def save_revoked_keys(keys_set):
+    """Save set of revoked keys to disk and LocalAppData."""
+    keys_list = sorted(list(set(str(x).strip() for x in keys_set if x)))
     path = get_revoked_file_path()
     try:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(hwids_list, f, indent=4)
+            json.dump(keys_list, f, indent=4)
     except Exception:
         pass
     appdata = os.environ.get("LOCALAPPDATA")
@@ -525,24 +676,72 @@ def save_revoked_hwids(hwids_set):
             backup_dir = os.path.join(appdata, "Movie_TR")
             os.makedirs(backup_dir, exist_ok=True)
             with open(os.path.join(backup_dir, REVOKED_FILE_NAME), "w", encoding="utf-8") as f:
-                json.dump(hwids_list, f, indent=4)
+                json.dump(keys_list, f, indent=4)
         except Exception:
             pass
 
-def add_revoked_hwid(hwid):
-    if not hwid:
+def add_revoked_key(key_str):
+    """Add a license key or signature to revocation list."""
+    if not key_str:
         return
-    hwid = hwid.upper().strip()
-    s = load_revoked_hwids()
-    s.add(hwid)
-    save_revoked_hwids(s)
+    k = str(key_str).strip()
+    s = load_revoked_keys()
+    s.add(k)
+    parts = k.split('-')
+    if len(parts) >= 3:
+        s.add(parts[-1])
+    save_revoked_keys(s)
+
+def remove_revoked_key(key_str):
+    """Remove a license key or signature from revocation list."""
+    if not key_str:
+        return
+    k = str(key_str).strip()
+    s = load_revoked_keys()
+    s.discard(k)
+    parts = k.split('-')
+    if len(parts) >= 3:
+        s.discard(parts[-1])
+        try:
+            payload_b64 = parts[1]
+            pad = len(payload_b64) % 4
+            if pad:
+                payload_b64 += "=" * (4 - pad)
+            p_bytes = base64.urlsafe_b64decode(payload_b64.encode('utf-8'))
+            p_obj = json.loads(p_bytes.decode('utf-8'))
+            mid = p_obj.get("m", "")
+            if mid:
+                s.discard(mid.upper().strip())
+                m_norm = normalize_hwid(mid)
+                if m_norm:
+                    s.discard(m_norm)
+                m_suf = mid.split('-')[-1] if '-' in mid else ""
+                if m_suf and len(m_suf) == 4:
+                    s.discard(m_suf)
+        except Exception:
+            pass
+    save_revoked_keys(s)
+
+def load_revoked_hwids():
+    return load_revoked_keys()
+
+def save_revoked_hwids(hwids_set):
+    save_revoked_keys(hwids_set)
+
+def add_revoked_hwid(hwid):
+    add_revoked_key(hwid)
 
 def remove_revoked_hwid(hwid):
     if not hwid:
         return
-    hwid = hwid.upper().strip()
-    s = load_revoked_hwids()
-    if hwid in s:
-        s.discard(hwid)
-        save_revoked_hwids(s)
+    h = str(hwid).upper().strip()
+    norm = normalize_hwid(h)
+    suffix = h.split('-')[-1] if '-' in h else ""
+    s = load_revoked_keys()
+    s.discard(h)
+    if norm:
+        s.discard(norm)
+    if suffix and len(suffix) == 4:
+        s.discard(suffix)
+    save_revoked_keys(s)
 
