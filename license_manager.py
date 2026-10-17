@@ -106,6 +106,12 @@ def get_hardware_id():
     if _CACHED_HWID is not None:
         return _CACHED_HWID
 
+    # 1. Prefer previously saved/locked HWID on this system (100% immune to boot timing & WMIC timeout)
+    stored = get_system_stored_hwid()
+    if stored and (stored.startswith("TR-") or stored.startswith("TRDL-")) and len(stored) >= 19:
+        _CACHED_HWID = stored
+        return _CACHED_HWID
+
     m_guid = get_machine_guid()
     sys_uuid = get_system_uuid()
     
@@ -118,6 +124,22 @@ def get_hardware_id():
         
     h = hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()
     _CACHED_HWID = f"TR-{h[0:4]}-{h[4:8]}-{h[8:12]}-{h[12:16]}"
+
+    # Auto-save HWID immediately to Registry & LocalAppData so it remains permanent across boots
+    try:
+        if winreg:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Movie_TR")
+            winreg.SetValueEx(key, "HardwareID", 0, winreg.REG_SZ, _CACHED_HWID)
+            winreg.CloseKey(key)
+        appdata = os.environ.get("LOCALAPPDATA")
+        if appdata:
+            lic_dir = os.path.join(appdata, "Movie_TR")
+            os.makedirs(lic_dir, exist_ok=True)
+            with open(os.path.join(lic_dir, "hardware_id.txt"), "w", encoding="utf-8") as f:
+                f.write(_CACHED_HWID)
+    except Exception:
+        pass
+
     return _CACHED_HWID
 
 def save_license_to_system(key_str, hwid=None):
@@ -249,6 +271,41 @@ def generate_license_key(machine_id, user_name, expiry_date, plan="VIP"):
     sig = hmac.new(SECRET_SALT.encode('utf-8'), payload_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16].upper()
     return f"TRVIP-{payload_b64}-{sig}"
 
+def get_valid_hardware_ids():
+    """
+    Returns a set of all valid hardware ID variations for this machine.
+    This guarantees that even if WMIC / PowerShell timed out on a cold boot,
+    the Key will never be rejected.
+    """
+    valid = set()
+    stored = get_system_stored_hwid()
+    if stored:
+        valid.add(stored.upper().strip())
+
+    m_guid = get_machine_guid()
+    sys_uuid = get_system_uuid()
+
+    if m_guid and sys_uuid:
+        raw_full = f"TR_AI_{m_guid}_{sys_uuid}"
+        h_full = hashlib.sha256(raw_full.encode("utf-8")).hexdigest().upper()
+        valid.add(f"TR-{h_full[0:4]}-{h_full[4:8]}-{h_full[8:12]}-{h_full[12:16]}")
+
+    if m_guid:
+        raw_guid = f"TR_AI_{m_guid}_"
+        h_guid = hashlib.sha256(raw_guid.encode("utf-8")).hexdigest().upper()
+        valid.add(f"TR-{h_guid[0:4]}-{h_guid[4:8]}-{h_guid[8:12]}-{h_guid[12:16]}")
+
+    try:
+        import uuid
+        mac = str(uuid.getnode())
+        raw_mac = f"TR_AI_FALLBACK_{mac}"
+        h_mac = hashlib.sha256(raw_mac.encode("utf-8")).hexdigest().upper()
+        valid.add(f"TR-{h_mac[0:4]}-{h_mac[4:8]}-{h_mac[8:12]}-{h_mac[12:16]}")
+    except Exception:
+        pass
+
+    return valid
+
 def verify_license_key(key_str, current_machine_id=None):
     """
     Verify if a license key is valid, authentic, and matches current machine.
@@ -290,10 +347,10 @@ def verify_license_key(key_str, current_machine_id=None):
     if not hmac.compare_digest(provided_sig, expected_sig):
         return False, "License Key ក្លែងក្លាយ ឬត្រូវបានកែប្រែដោយគ្មានការអនុញ្ញាត!"
         
-    # Check Hardware Lock
+    # Check Hardware Lock with Multi-HWID tolerance
     key_machine = payload_obj.get("m", "").upper().strip()
     cur_id = current_machine_id.upper().strip()
-    stored_id = get_system_stored_hwid().upper().strip()
+    valid_ids = get_valid_hardware_ids()
 
     # Check Revocation (Blacklist for Key, Signature, and Machine ID)
     try:
@@ -305,12 +362,12 @@ def verify_license_key(key_str, current_machine_id=None):
     except Exception:
         pass
 
-    if key_machine != cur_id:
-        # Check against previously activated hardware ID in registry
-        if stored_id and key_machine == stored_id:
-            pass # Valid match with system-stored hardware profile
-        else:
-            return False, f"Key នេះមិនត្រូវគ្នាជាមួយម៉ាស៊ីននេះទេ!\n(Key សម្រាប់ម៉ាស៊ីន {key_machine}, ប៉ុន្តែម៉ាស៊ីននេះគឺ {current_machine_id})"
+    if key_machine in valid_ids or (cur_id and key_machine == cur_id):
+        # Successfully matched one of the machine's hardware signatures!
+        # Lock this exact hardware ID to the system so future checks remain instant and consistent
+        save_license_to_system(clean_key, hwid=key_machine)
+    else:
+        return False, f"Key នេះមិនត្រូវគ្នាជាមួយម៉ាស៊ីននេះទេ!\n(Key សម្រាប់ម៉ាស៊ីន {key_machine}, ប៉ុន្តែម៉ាស៊ីននេះគឺ {current_machine_id})"
         
     # Check Expiry
     exp_str = payload_obj.get("e", "")
@@ -475,14 +532,20 @@ def save_license_history(history_list):
             pass
     return True
 
-def record_license_to_history(machine_id, user_name, expiry_date, plan, key, duration=None, notes="", channel="PC Generator"):
+def record_license_to_history(machine_id, user_name, expiry_date, plan, key, duration=None, notes="", channel="PC Generator", app=None):
     """
     Record an issued license to history.
-    Automatically revokes/invalidates ANY previous old keys for this machine_id,
-    guaranteeing only the newest key remains active and thieves cannot use old keys.
+    Automatically revokes/invalidates previous old keys for this machine_id ONLY within the same app,
+    guaranteeing only the newest key remains active without affecting other applications.
     """
     history = load_license_history()
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Determine app kind: "TR_TOOL_DL" or "Movie_TR"
+    key_str = str(key).strip()
+    mid_str = str(machine_id).upper().strip()
+    if not app:
+        app = "TR_TOOL_DL" if (key_str.startswith("TRDL-") or mid_str.startswith("TRDL-")) else "Movie_TR"
 
     # Determine duration label if not given
     if not duration:
@@ -500,24 +563,32 @@ def record_license_to_history(machine_id, user_name, expiry_date, plan, key, dur
         "id": f"LIC-{datetime.now().strftime('%Y%m%d%H%M%S')}-{len(history)+1:03d}",
         "created_at": now_str,
         "customer_name": str(user_name).strip() or "Customer",
-        "machine_id": str(machine_id).upper().strip(),
+        "machine_id": mid_str,
+        "app": str(app).strip(),
         "plan": str(plan).strip().upper() or "VIP",
         "duration": duration,
         "expiry_date": str(expiry_date).strip(),
-        "key": str(key).strip(),
+        "key": key_str,
         "status": "active",
         "notes": notes,
         "channel": channel
     }
 
-    norm_mid = str(entry["machine_id"]).upper().strip()
+    norm_mid = mid_str
+    norm_app = entry["app"]
     prev_keys_to_revoke = []
     updated = False
 
     for i, item in enumerate(history):
         item_mid = str(item.get("machine_id", "")).upper().strip()
-        # Match same machine ID or same key
-        if item_mid == norm_mid or item.get("key") == entry["key"]:
+        item_k = str(item.get("key", "")).strip()
+        item_app = str(item.get("app", "TR_TOOL_DL" if item_k.startswith("TRDL-") else "Movie_TR")).strip()
+
+        # ONLY match if it is the EXACT same app on the same machine, or exact same key!
+        is_same_app_machine = (item_mid == norm_mid and item_app == norm_app)
+        is_same_key = (item_k and item_k == entry["key"])
+
+        if is_same_app_machine or is_same_key:
             old_k = item.get("key")
             if old_k and old_k != entry["key"]:
                 prev_keys_to_revoke.append(old_k)
