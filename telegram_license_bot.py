@@ -155,59 +155,6 @@ def save_config(cfg):
     except Exception as e:
         print(f"Error saving {CONFIG_FILE}: {e}")
 
-VERSION_FILE = os.path.join(BASE_DIR, "version_info.json")
-
-def load_version_info(app_name="Movie_TR"):
-    defaults = {
-        "Movie_TR": {
-            "app": "Movie_TR",
-            "version": "2.6.0",
-            "release_date": "2026-10-15",
-            "download_url": "",
-            "file_size": "166 MB",
-            "mandatory": False,
-            "title": "Movie TR AI v2.6.0 (Edge-TTS 7.3.1 + Multi-HWID)",
-            "changelog": "✨ Update Edge-TTS 7.3.1 (សំឡេងខ្មែររលូន លឿនជាងមុន និងគ្មាន Error)\n🔒 ប្រព័ន្ធចាក់សោរ Hardware ID និង Auto-Activation កាន់តែឆ្លាតវៃ\n⚡ បង្កើនល្បឿន Render Subtitle និង Audio Dubbing"
-        },
-        "TR_TOOL_DL": {
-            "app": "TR_TOOL_DL",
-            "version": "1.2.0",
-            "release_date": "2026-10-15",
-            "download_url": "",
-            "file_size": "50 MB",
-            "mandatory": False,
-            "title": "TR Video Downloader v1.2.0",
-            "changelog": "✨ បន្ថែមការទាញយកពី TikTok / Facebook / Douyin ល្បឿនលឿន"
-        }
-    }
-    if os.path.exists(VERSION_FILE):
-        try:
-            with open(VERSION_FILE, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-                if isinstance(saved, dict):
-                    if app_name in saved:
-                        return saved[app_name]
-                    elif "version" in saved:
-                        return saved
-        except Exception:
-            pass
-    return defaults.get(app_name, defaults["Movie_TR"])
-
-def save_version_info(app_name, data):
-    try:
-        all_data = {}
-        if os.path.exists(VERSION_FILE):
-            try:
-                with open(VERSION_FILE, "r", encoding="utf-8") as f:
-                    all_data = json.load(f)
-            except Exception:
-                all_data = {}
-        all_data[app_name] = data
-        with open(VERSION_FILE, "w", encoding="utf-8") as f:
-            json.dump(all_data, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        print(f"Error saving version info: {e}")
-
 DL_SECRET_SALT = "TR_DL_SECURE_KEY_2026_@KhmerVideoDownloader#PRO"
 
 def generate_license_key(machine_id, user_name, expiry_date, plan="VIP", app=None):
@@ -227,6 +174,18 @@ def generate_license_key(machine_id, user_name, expiry_date, plan="VIP", app=Non
         payload_b64 = base64.urlsafe_b64encode(payload_str.encode('utf-8')).decode('utf-8').rstrip('=')
         sig = hmac.new(DL_SECRET_SALT.encode('utf-8'), payload_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16].upper()
         return f"TRDL-{payload_b64}-{sig}"
+    elif app == "TR_HongGuo":
+        payload_obj = {
+            "app": "TR_HongGuo",
+            "m": mid,
+            "u": str(user_name).strip(),
+            "e": str(expiry_date).strip(),
+            "p": str(plan).strip()
+        }
+        payload_str = json.dumps(payload_obj, separators=(',', ':'), ensure_ascii=False)
+        payload_b64 = base64.urlsafe_b64encode(payload_str.encode('utf-8')).decode('utf-8').rstrip('=')
+        sig = hmac.new(SECRET_SALT.encode('utf-8'), payload_str.encode('utf-8'), hashlib.sha256).hexdigest()[:16].upper()
+        return f"TRVIP-{payload_b64}-{sig}"
     else:
         payload_obj = {
             "m": mid,
@@ -317,7 +276,6 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
 
         if path == "/check":
             hwid_list = params.get("hwid", [])
-            app_filter = params.get("app", [""])[0].strip()
             if not hwid_list:
                 self._send_json(400, {"status": "error", "message": "Missing hwid parameter"})
                 return
@@ -332,14 +290,6 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
             for h_item in load_license_history():
                 m = h_item.get("machine_id", "").upper().strip()
                 if m == hwid:
-                    item_k = str(h_item.get("key", "")).strip()
-                    item_app = str(h_item.get("app", "TR_TOOL_DL" if item_k.startswith("TRDL-") else "Movie_TR")).strip()
-                    if app_filter:
-                        if app_filter == "Movie_TR" and (item_app == "TR_TOOL_DL" or item_k.startswith("TRDL-")):
-                            continue
-                        elif app_filter == "TR_TOOL_DL" and (item_app == "Movie_TR" or item_k.startswith("TRVIP-")):
-                            continue
-
                     if h_item.get("status") == "revoked":
                         is_revoked_in_file = True
                         break
@@ -398,32 +348,11 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
             })
             return
 
-        if path in ["/version", "/check-update"]:
-            app_filter = params.get("app", ["Movie_TR"])[0].strip() or "Movie_TR"
-            info = load_version_info(app_filter)
-            self._send_json(200, {
-                "status": "ok",
-                **info
-            })
-            return
-
         self._send_json(404, {"status": "not_found"})
 
     def do_POST(self):
         parsed = urlparse(self.path)
         path = parsed.path
-        if path in ["/set-version", "/update-version"]:
-            content_len = int(self.headers.get('Content-Length', 0))
-            body = self.rfile.read(content_len)
-            try:
-                data = json.loads(body.decode('utf-8'))
-                app_target = data.get("app", "Movie_TR")
-                save_version_info(app_target, data)
-                self._send_json(200, {"status": "ok", "message": "Version updated successfully"})
-            except Exception as e:
-                self._send_json(400, {"status": "error", "message": str(e)})
-            return
-
         if path == "/revoke":
             content_len = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_len)
@@ -525,8 +454,6 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
 
                 # 3. Notify Admin Telegram
                 if self.bot_instance.admin_chat_id:
-                    is_dl = str(hwid).upper().startswith("TRDL-") or str(key).startswith("TRDL-")
-                    app_title = "TR TOOL DL (Video Downloader)" if is_dl else "Movie TR"
                     exp_disp = "ពេញមួយជីវិត (Lifetime)" if exp_date == "LIFETIME" else f"ដល់ {exp_date}"
                     msg = (
                         f"🎉 *[អតិថិជនបានបញ្ចូល/ប្តូរ Key ជោគជ័យ]*\n\n"
@@ -535,7 +462,7 @@ class LicenseHttpHandler(http.server.BaseHTTPRequestHandler):
                         f"👑 *គម្រោង:* {plan}\n"
                         f"📅 *សុពលភាព:* {exp_disp}\n"
                         f"⏰ *ម៉ោង:* {datetime.now().strftime('%H:%M:%S • %d/%m/%Y')}\n\n"
-                        f"✨ កម្មវិធី {app_title} លើកុំព្យូទ័រនោះ កំពុងដំណើរការធម្មតា!"
+                        f"✨ កម្មវិធី Movie TR លើកុំព្យូទ័រនោះ កំពុងដំណើរការធម្មតា!"
                     )
                     self.bot_instance.send_message(self.bot_instance.admin_chat_id, msg)
 
@@ -699,8 +626,12 @@ class TelegramLicenseBot:
 
         # Notify Admin
         if self.admin_chat_id:
-            is_dl = str(hwid).upper().startswith("TRDL-") or (str(is_online) == "TR_TOOL_DL")
-            app_title = "🚀 TR TOOL DL (Video Downloader)" if is_dl else "🎬 Movie TR AI"
+            if str(is_online) == "TR_HongGuo":
+                app_title = "🍎 TR HongGuo (MENG DOWNLOADER)"
+            elif str(hwid).upper().startswith("TRDL-") or (str(is_online) == "TR_TOOL_DL"):
+                app_title = "🎬 TR TOOL DL (Video Downloader)"
+            else:
+                app_title = "🎬 Movie TR AI"
             request_source = f"ពីក្នុងកម្មវិធី {app_title} (Auto-Activate)" if is_online else "តាមរយៈ Telegram Bot"
             display_tg_user = f"{user_name} (@{username})" if (username and f"@{username}" not in user_name) else user_name
             admin_msg = (
@@ -794,10 +725,17 @@ class TelegramLicenseBot:
             else:
                 key_username = cust_name
 
-            is_dl = (req.get("app") == "TR_TOOL_DL") or (str(is_online) == "TR_TOOL_DL") or str(hwid).upper().startswith("TRDL-")
-            app_code = "TR_TOOL_DL" if is_dl else "Movie_TR"
-            app_title = "🚀 TR TOOL DL (Video Downloader)" if is_dl else "🎬 Movie TR AI"
-            key = generate_license_key(hwid, key_username, exp_date, plan=plan_name, app=app_code)
+            app_type = req.get("is_online")
+            if app_type == "TR_HongGuo":
+                app_title = "🍎 TR HongGuo (MENG DOWNLOADER)"
+                app_id = "TR_HongGuo"
+            elif str(hwid).upper().startswith("TRDL-") or (app_type == "TR_TOOL_DL"):
+                app_title = "🎬 TR TOOL DL (Video Downloader)"
+                app_id = "TR_TOOL_DL"
+            else:
+                app_title = "🎬 Movie TR AI"
+                app_id = "Movie_TR"
+            key = generate_license_key(hwid, key_username, exp_date, plan=plan_name, app=app_id)
             # Clear from revoked list if previously revoked
             if hasattr(self, "revoked_hwids") and hwid in self.revoked_hwids:
                 self.revoked_hwids.remove(hwid)
@@ -809,7 +747,6 @@ class TelegramLicenseBot:
             # 1. Save to approved_licenses memory cache for instant Auto-Activation!
             self.approved_licenses[hwid] = {
                 "key": key,
-                "app": app_code,
                 "customer_name": key_username,
                 "plan": plan_name,
                 "expiry_date": exp_date,
@@ -822,7 +759,7 @@ class TelegramLicenseBot:
                 record_license_to_history(
                     hwid, key_username, exp_date, plan_name, key,
                     duration=exp_khmer, notes=f"Approved by Admin ({channel_name})",
-                    channel=channel_name, app=app_code
+                    channel=channel_name
                 )
             except Exception as ex:
                 print(f"Error logging to history: {ex}")
@@ -910,8 +847,7 @@ class TelegramLicenseBot:
                     plan_name = "VIP"
 
             is_dl = str(hwid).upper().startswith("TRDL-")
-            app_code = "TR_TOOL_DL" if is_dl else "Movie_TR"
-            key = generate_license_key(hwid, user_name, exp_date, plan=plan_name, app=app_code)
+            key = generate_license_key(hwid, user_name, exp_date, plan=plan_name, app="TR_TOOL_DL" if is_dl else "Movie_TR")
             if hasattr(self, "revoked_hwids"):
                 self.revoked_hwids.discard(hwid)
             try:
@@ -923,7 +859,6 @@ class TelegramLicenseBot:
             # Record to history and update live approved licenses for instant Auto-Activation
             self.approved_licenses[hwid] = {
                 "key": key,
-                "app": app_code,
                 "customer_name": user_name,
                 "plan": plan_name,
                 "expiry_date": exp_date,
@@ -934,7 +869,7 @@ class TelegramLicenseBot:
                 license_manager.record_license_to_history(
                     hwid, user_name, exp_date, "VIP", key,
                     duration=exp_khmer, notes="Direct /gen Telegram command",
-                    channel="Telegram Bot", app=app_code
+                    channel="Telegram Bot"
                 )
             except Exception as ex:
                 print(f"Error logging /gen to history: {ex}")
@@ -1012,56 +947,6 @@ class TelegramLicenseBot:
                 f"✅ *បានបើកសិទ្ធិ (Unrevoked) ឡើងវិញជោគជ័យ!*\n\n"
                 f"💻 *Machine ID:* `{target_hwid}`\n"
                 f"✨ កម្មវិធី Movie TR លើកុំព្យូទ័រនោះ អាចប្រើប្រាស់ឡើងវិញបានធម្មតា!"
-            )
-            return
-
-        if cmd == "/version" and str(chat_id) == str(self.admin_chat_id):
-            info = load_version_info("Movie_TR")
-            dl_text = info.get('download_url') or "_(មិនទាន់កំណត់ Link)_"
-            resp = (
-                f"🚀 *ព័ត៌មានជំនាន់ Movie TR AI បច្ចុប្បន្ន:*\n\n"
-                f"🏷️ *Version:* `{info.get('version', '2.6.0')}`\n"
-                f"📅 *កាលបរិច្ឆេទ:* {info.get('release_date', '')}\n"
-                f"📦 *ទំហំ File:* {info.get('file_size', '')}\n"
-                f"🔗 *Link Download:* {dl_text}\n\n"
-                f"📝 *Changelog:*\n{info.get('changelog', '')}\n\n"
-                f"👉 *របៀបកែប្រែ Version & Link ថ្មី:*\n"
-                f"`/setversion <ver> <url> [កំណត់ចំណាំ]`\n\n"
-                f"ឧទាហរណ៍៖\n"
-                f"`/setversion 2.6.1 https://github.com/.../Movie_TR.zip Fixed some bugs`"
-            )
-            self.send_message(chat_id, resp)
-            return
-
-        if cmd == "/setversion" and str(chat_id) == str(self.admin_chat_id):
-            if len(parts) < 3:
-                self.send_message(
-                    chat_id,
-                    "👉 *របៀបកំណត់ Version ថ្មី:*\n`/setversion <version> <download_url> [កំណត់ចំណាំ]`\n\n"
-                    "ឧទាហរណ៍៖\n`/setversion 2.6.1 https://.../Movie_TR_v2.6.1.zip Update Edge-TTS`"
-                )
-                return
-            new_ver = parts[1].strip()
-            new_url = parts[2].strip()
-            new_notes = " ".join(parts[3:]).strip() if len(parts) > 3 else "✨ ការកែលម្អប្រព័ន្ធ និងបន្ថែមមុខងារថ្មី"
-            ver_obj = {
-                "app": "Movie_TR",
-                "version": new_ver,
-                "release_date": datetime.now().strftime("%Y-%m-%d"),
-                "download_url": new_url,
-                "file_size": "166 MB",
-                "mandatory": False,
-                "title": f"Movie TR AI v{new_ver}",
-                "changelog": new_notes
-            }
-            save_version_info("Movie_TR", ver_obj)
-            self.send_message(
-                chat_id,
-                f"✅ *បានធ្វើបច្ចុប្បន្នភាព Version ជោគជ័យ!*\n\n"
-                f"🚀 *Version ថ្មី:* `{new_ver}`\n"
-                f"🔗 *URL:* {new_url}\n"
-                f"📝 *Notes:* {new_notes}\n\n"
-                f"✨ រាល់កុំព្យូទ័រអតិថិជនទាំងអស់នឹងឃើញដំណឹង Update នេះភ្លាមៗ!"
             )
             return
 
